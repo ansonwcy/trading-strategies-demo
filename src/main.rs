@@ -1,40 +1,65 @@
-use trading_strategies::{Strategy, CandleData};
+use trading_strategies::Strategy;
 use trading_strategies::core::{ProposedTrade, TradeDecision, TradeEvent, TradeObserver};
-use trading_strategies::strategies::config::MovingAverageConfig;
-use trading_strategies::strategies::moving_average::MovingAverageStrategy;
+use trading_strategies::core::tick::TickData;
+use trading_strategies::core::tick_strategy::TickStrategyWrapper;
+use trading_strategies::strategies::config::StochasticConfig;
+use trading_strategies::strategies::stochastic::StochasticStrategy;
+use chrono;
+use std::sync::{Arc, Mutex};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use serde::{Deserialize, Serialize};
 
-// Simple candle implementation
-struct SimpleCandle {
-    price: f64,
+// Tick data structure matching the JSONL format
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MarketTick {
     timestamp: i64,
+    price: f64,
+    volume: f64,
 }
 
-impl CandleData for SimpleCandle {
-    fn open(&self) -> f64 { self.price }
-    fn high(&self) -> f64 { self.price + 1.0 }
-    fn low(&self) -> f64 { self.price - 1.0 }
-    fn close(&self) -> f64 { self.price }
-    fn volume(&self) -> f64 { 1000.0 }
+impl TickData for MarketTick {
     fn timestamp(&self) -> i64 { self.timestamp }
+    fn price(&self) -> f64 { self.price }
+    fn volume(&self) -> f64 { self.volume }
+    fn symbol(&self) -> &str { "BTCUSDT" }
+}
+
+// Shared counters for tracking hook activity
+#[derive(Clone)]
+struct HookCounters {
+    trades_validated: Arc<Mutex<usize>>,
+    trades_rejected: Arc<Mutex<usize>>,
+    trades_modified: Arc<Mutex<usize>>,
+    trades_executed: Arc<Mutex<usize>>,
+}
+
+impl HookCounters {
+    fn new() -> Self {
+        Self {
+            trades_validated: Arc::new(Mutex::new(0)),
+            trades_rejected: Arc::new(Mutex::new(0)),
+            trades_modified: Arc::new(Mutex::new(0)),
+            trades_executed: Arc::new(Mutex::new(0)),
+        }
+    }
 }
 
 // Example observer that validates and modifies trades
 struct RiskManager {
     max_price: f64,
     max_position_size: f64,
-    trades_validated: usize,
-    trades_rejected: usize,
-    trades_modified: usize,
+    counters: HookCounters,
+    trade_count: usize,
 }
 
 impl RiskManager {
-    fn new(max_price: f64, max_position_size: f64) -> Self {
+    fn new(max_price: f64, max_position_size: f64, counters: HookCounters) -> Self {
         Self { 
             max_price, 
             max_position_size,
-            trades_validated: 0,
-            trades_rejected: 0,
-            trades_modified: 0,
+            counters,
+            trade_count: 0,
         }
     }
 }
@@ -42,9 +67,14 @@ impl RiskManager {
 impl TradeObserver for RiskManager {
     // Called BEFORE trade execution
     fn before_trade(&mut self, proposed: &ProposedTrade) -> TradeDecision {
-        self.trades_validated += 1;
+        self.trade_count += 1;
+        let mut validated = self.counters.trades_validated.lock().unwrap();
+        *validated += 1;
+        let validation_num = *validated;
+        drop(validated);
         
-        println!("\n🔍 Pre-trade Validation #{}", self.trades_validated);
+        println!("\n🔍 [PRE-TRADE HOOK] Validation #{}", validation_num);
+        println!("   Timestamp: {}", chrono::Local::now().format("%H:%M:%S%.3f"));
         println!("   Proposed: {} {} units at ${:.2}", 
             match proposed.side {
                 trading_strategies::core::Side::Long => "BUY",
@@ -56,97 +86,240 @@ impl TradeObserver for RiskManager {
         
         // Validation 1: Check price limits
         if proposed.price > self.max_price {
-            self.trades_rejected += 1;
-            println!("   ❌ REJECTED: Price exceeds ${:.2} limit", self.max_price);
+            let mut rejected = self.counters.trades_rejected.lock().unwrap();
+            *rejected += 1;
+            println!("   ❌ REJECTED: Price ${:.2} exceeds limit ${:.2}", proposed.price, self.max_price);
             return TradeDecision::Reject("Price too high".to_string());
         }
         
-        // Validation 2: Adjust position size if needed
+        // Validation 2: Check if position size exceeds max
         if proposed.quantity > self.max_position_size {
-            self.trades_modified += 1;
-            println!("   ⚠️  MODIFIED: Reducing size to {} units", self.max_position_size);
-            let mut modified = proposed.clone();
-            modified.quantity = self.max_position_size;
-            return TradeDecision::Modify(modified);
+            let mut modified = self.counters.trades_modified.lock().unwrap();
+            *modified += 1;
+            println!("   ⚠️  MODIFIED: Reducing size from {:.2} to {:.2} units", proposed.quantity, self.max_position_size);
+            let mut modified_trade = proposed.clone();
+            modified_trade.quantity = self.max_position_size;
+            return TradeDecision::Modify(modified_trade);
         }
         
-        println!("   ✅ APPROVED");
+        // Validation 3: Dynamic risk management - reduce position size when price is near limit
+        if proposed.price > 2950.0 && proposed.price <= self.max_price {
+            // High price zone (2950-3000) - reduce position for risk management
+            let risk_adjusted_size = proposed.quantity * 0.7; // Reduce by 30%
+            if risk_adjusted_size < proposed.quantity {
+                let mut modified = self.counters.trades_modified.lock().unwrap();
+                *modified += 1;
+                println!("   ⚠️  MODIFIED: High price zone (>${:.2}) - reducing size from {:.2} to {:.2} units for risk management", 
+                    2950.0, proposed.quantity, risk_adjusted_size);
+                let mut modified_trade = proposed.clone();
+                modified_trade.quantity = risk_adjusted_size;
+                return TradeDecision::Modify(modified_trade);
+            }
+        }
+        
+        println!("   ✅ APPROVED: Trade can proceed as proposed");
         TradeDecision::Approve
     }
     
     // Called AFTER trade execution
     fn post_trade(&mut self, event: TradeEvent) {
+        let mut executed = self.counters.trades_executed.lock().unwrap();
+        *executed += 1;
+        let execution_num = *executed;
+        drop(executed);
+        
+        println!("\n📊 [POST-TRADE HOOK] Execution #{}", execution_num);
+        println!("   Timestamp: {}", chrono::Local::now().format("%H:%M:%S%.3f"));
+        
         match event {
             TradeEvent::Buy(trade) => {
-                println!("   → Executed: Bought {} units at ${:.2}", 
-                    trade.quantity, trade.entry_price);
+                println!("   Type: BUY ORDER EXECUTED");
+                println!("   Details:");
+                println!("     - Symbol: {}", trade.symbol);
+                println!("     - Entry Price: ${:.2}", trade.entry_price);
+                println!("     - Quantity: {} units", trade.quantity);
+                println!("     - Total Cost: ${:.2}", trade.entry_price * trade.quantity);
+                println!("     - Entry Time: {}", format_timestamp(trade.entry_time));
+                println!("   💰 Position opened successfully");
             }
             TradeEvent::Sell(trade) => {
-                println!("   → Executed: Sold at ${:.2}, P&L: ${:.2}", 
-                    trade.exit_price, trade.pnl);
+                println!("   Type: SELL ORDER EXECUTED");
+                println!("   Details:");
+                println!("     - Symbol: {}", trade.symbol);
+                println!("     - Entry Price: ${:.2}", trade.entry_price);
+                println!("     - Exit Price: ${:.2}", trade.exit_price);
+                println!("     - Quantity: {} units", trade.quantity);
+                println!("     - P&L: ${:.2} ({:.2}%)", trade.pnl, trade.pnl_percentage);
+                println!("     - Entry Time: {}", format_timestamp(trade.entry_time));
+                println!("     - Exit Time: {}", format_timestamp(trade.exit_time));
+                println!("     - Duration: {} minutes", (trade.exit_time - trade.entry_time) / 60000);
+                if trade.pnl > 0.0 {
+                    println!("   ✅ Profitable trade!");
+                } else {
+                    println!("   ❌ Loss incurred");
+                }
             }
         }
     }
 }
 
-fn main() {
-    println!("=== Pre-trade Hooks Demo ===\n");
+// Helper function to format timestamps
+fn format_timestamp(timestamp: i64) -> String {
+    use chrono::{DateTime, Utc};
+    let secs = timestamp / 1000;
+    let dt = DateTime::<Utc>::from_timestamp(secs, 0).unwrap();
+    dt.format("%H:%M:%S").to_string()
+}
+
+// Load ticks from JSONL file
+fn load_ticks(filename: &str) -> Result<Vec<MarketTick>, Box<dyn std::error::Error>> {
+    let file = File::open(filename)?;
+    let reader = BufReader::new(file);
+    let mut ticks = Vec::new();
     
-    // Create strategy that tries to buy 2 units
-    let config = MovingAverageConfig {
-        fast_period: 3,
-        slow_period: 5,
-        position_size: 2.0,  // Will try to buy 2 units
-        min_separation_pct: 0.01,
-        min_bars_since_cross: 0,
-        use_volume_confirmation: false,
-        volume_surge_threshold: 1.5,
+    for line in reader.lines() {
+        let line = line?;
+        if !line.trim().is_empty() {
+            let tick: MarketTick = serde_json::from_str(&line)?;
+            ticks.push(tick);
+        }
+    }
+    
+    Ok(ticks)
+}
+
+fn main() {
+    println!("=== Pre-trade/Post-trade Hooks Demo with Real Tick Data ===");
+    println!("=========================================================\n");
+    
+    // Load tick data
+    let ticks = match load_ticks("stochastic_hooks_demo.jsonl") {
+        Ok(ticks) => {
+            println!("📁 Loaded {} ticks from stochastic_final_demo.jsonl", ticks.len());
+            ticks
+        }
+        Err(e) => {
+            eprintln!("❌ Error loading ticks: {}", e);
+            return;
+        }
+    };
+    
+    // Create strategy configuration
+    let config = StochasticConfig {
+        k_period: 14,             // Standard stochastic period
+        d_period: 3,              // Standard smoothing period
+        oversold_threshold: 20.0, // Buy signal below this level
+        overbought_threshold: 80.0, // Sell signal above this level
+        position_size: 1.5,       // Base position size (can be modified by risk manager)
         atr_period: 14,
         atr_multiplier: 2.0,
     };
     
-    let mut strategy = MovingAverageStrategy::new(config, 10000.0);
+    // Create strategy wrapped for tick processing
+    let strategy = StochasticStrategy::new(config, 10000.0);
+    let mut tick_wrapper = TickStrategyWrapper::new(strategy, 10); // 10-second candles for more signals
     
-    // Add risk manager that limits trades
-    println!("Risk Manager Settings:");
-    println!("- Max price: $107.00");
-    println!("- Max position size: 1.0 unit");
+    // Add risk manager with realistic limits
+    println!("\n📋 Risk Manager Configuration:");
+    println!("   - Max allowed price: $3,000.00");
+    println!("   - Max position size: 1.0 unit");
+    println!("   - Initial capital: $10,000.00");
     
-    let risk_manager = RiskManager::new(107.0, 1.0);
-    strategy.add_observer(Box::new(risk_manager));
+    let counters = HookCounters::new();
+    let risk_manager = RiskManager::new(3000.0, 1.0, counters.clone());
+    tick_wrapper.strategy_mut().add_observer(Box::new(risk_manager));
     
-    // Simulate market data
-    let prices = vec![
-        // Downtrend
-        105.0, 104.0, 103.0, 102.0, 101.0, 100.0,
-        // Uptrend - triggers BUY (will be modified)
-        101.0, 102.0, 103.0, 104.0, 105.0, 106.0,
-        // High prices - triggers another BUY (will be rejected)
-        107.0, 108.0, 109.0, 110.0,
-        // Downtrend - triggers SELL
-        109.0, 108.0, 107.0, 106.0, 105.0, 104.0, 103.0,
-    ];
+    // Process ticks
+    println!("\n📈 Market Simulation Starting...");
+    println!("   Processing {} ticks", ticks.len());
+    if let (Some(first), Some(last)) = (ticks.first(), ticks.last()) {
+        println!("   Time range: {} to {}", 
+            format_timestamp(first.timestamp), 
+            format_timestamp(last.timestamp));
+        println!("   Price range: ${:.2} to ${:.2}\n", 
+            ticks.iter().map(|t| t.price).fold(f64::INFINITY, |a, b| a.min(b)),
+            ticks.iter().map(|t| t.price).fold(f64::NEG_INFINITY, |a, b| a.max(b)));
+    }
     
-    println!("\n📊 Processing {} price points...", prices.len());
+    // Track price for display
+    let mut last_price = 0.0;
+    let mut tick_count = 0;
     
-    for (i, &price) in prices.iter().enumerate() {
-        let candle = SimpleCandle {
-            price,
-            timestamp: (i as i64) * 60000,
-        };
-        strategy.process_candle(&candle);
+    for tick in &ticks {
+        tick_count += 1;
+        
+        // Show price movement periodically (every 10 ticks)
+        if tick_count % 10 == 1 {
+            if last_price == 0.0 {
+                println!("⏱️  [{}] Price: ${:.2} (starting)", 
+                    format_timestamp(tick.timestamp), tick.price);
+            } else if tick.price > last_price {
+                println!("⏱️  [{}] Price: ${:.2} ↗️  (+{:.2}%)", 
+                    format_timestamp(tick.timestamp), 
+                    tick.price,
+                    ((tick.price - last_price) / last_price) * 100.0);
+            } else if tick.price < last_price {
+                println!("⏱️  [{}] Price: ${:.2} ↘️  ({:.2}%)", 
+                    format_timestamp(tick.timestamp), 
+                    tick.price,
+                    ((tick.price - last_price) / last_price) * 100.0);
+            } else {
+                println!("⏱️  [{}] Price: ${:.2} →", 
+                    format_timestamp(tick.timestamp), tick.price);
+            }
+            last_price = tick.price;
+        }
+        
+        // Process the tick
+        tick_wrapper.process_tick(tick);
+    }
+    
+    // Force close any pending candle
+    if let Some(last_tick) = ticks.last() {
+        tick_wrapper.force_close_candle(last_tick.timestamp + 1000);
     }
     
     // Summary
-    println!("\n=== Summary ===");
-    println!("Completed trades: {}", strategy.get_trades().len());
-    let final_equity = strategy.calculate_equity(*prices.last().unwrap_or(&100.0));
-    println!("Final P&L: ${:.2}", final_equity - 10000.0);
+    println!("\n╔══════════════════════════════════╗");
+    println!("║        TRADING SUMMARY           ║");
+    println!("╚══════════════════════════════════╝");
     
-    println!("\n=== Pre-trade Hook Benefits ===");
-    println!("✓ Validate trades before execution");
-    println!("✓ Enforce risk limits automatically");
-    println!("✓ Modify trade parameters on the fly");
-    println!("✓ Integrate with external systems");
-    println!("✓ No changes needed to strategy logic");
+    let trades = tick_wrapper.strategy().get_trades();
+    let final_price = ticks.last().map(|t| t.price).unwrap_or(100.0);
+    let final_equity = tick_wrapper.strategy().calculate_equity(final_price);
+    let total_pnl = final_equity - 10000.0;
+    
+    println!("📊 Performance Metrics:");
+    println!("   - Initial Capital: $10,000.00");
+    println!("   - Final Equity: ${:.2}", final_equity);
+    println!("   - Total P&L: ${:.2} ({:.2}%)", total_pnl, (total_pnl / 10000.0) * 100.0);
+    println!("   - Completed Trades: {}", trades.len());
+    
+    // Count winning/losing trades
+    let winning_trades = trades.iter().filter(|t| t.pnl > 0.0).count();
+    let losing_trades = trades.iter().filter(|t| t.pnl <= 0.0).count();
+    
+    println!("\n📈 Trade Statistics:");
+    println!("   - Winning Trades: {}", winning_trades);
+    println!("   - Losing Trades: {}", losing_trades);
+    if !trades.is_empty() {
+        println!("   - Win Rate: {:.1}%", (winning_trades as f64 / trades.len() as f64) * 100.0);
+    }
+    
+    println!("\n🔍 Hook Activity Summary:");
+    let validations = *counters.trades_validated.lock().unwrap();
+    let rejections = *counters.trades_rejected.lock().unwrap();
+    let modifications = *counters.trades_modified.lock().unwrap();
+    let executions = *counters.trades_executed.lock().unwrap();
+    
+    println!("   - Pre-trade validations: {} total", validations);
+    println!("     • Approved: {}", validations - rejections - modifications);
+    println!("     • Modified: {}", modifications);
+    println!("     • Rejected: {}", rejections);
+    println!("   - Post-trade notifications: {} events", executions);
+    
+    println!("\n💡 Benefits Demonstrated:");
+    println!("   ✓ Pre-trade validation prevents bad trades");
+    println!("   ✓ Trade modification ensures risk limits");
+    println!("   ✓ Post-trade tracking for audit trails");
 }
