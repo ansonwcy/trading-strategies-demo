@@ -68,7 +68,7 @@ impl RiskManager {
 
 impl TradeObserver for RiskManager {
     // Called BEFORE trade execution
-    fn before_trade(&mut self, proposed: &ProposedTrade, _context: Option<&dyn Any>) -> TradeDecision {
+    fn pre_trade(&mut self, proposed: &ProposedTrade, _strategy_context: Option<&dyn Any>) -> TradeDecision {
         self.trade_count += 1;
         let mut validated = self.counters.trades_validated.lock().unwrap();
         *validated += 1;
@@ -124,7 +124,7 @@ impl TradeObserver for RiskManager {
     }
     
     // Called AFTER trade execution
-    fn post_trade(&mut self, event: TradeEvent, _context: Option<&dyn Any>) {
+    fn post_trade(&mut self, event: TradeEvent, _strategy_context: Option<&dyn Any>) {
         let mut executed = self.counters.trades_executed.lock().unwrap();
         *executed += 1;
         let execution_num = *executed;
@@ -169,7 +169,7 @@ impl TradeObserver for RiskManager {
 struct ContextAwareLogger;
 
 impl TradeObserver for ContextAwareLogger {
-    fn before_trade(&mut self, proposed: &ProposedTrade, context: Option<&dyn Any>) -> TradeDecision {
+    fn pre_trade(&mut self, proposed: &ProposedTrade, strategy_context: Option<&dyn Any>) -> TradeDecision {
         println!("\n🔎 [CONTEXT-AWARE OBSERVER] Pre-trade analysis");
         println!("   Proposed: {} {} units at ${:.2}", 
             match proposed.side {
@@ -181,7 +181,7 @@ impl TradeObserver for ContextAwareLogger {
         );
         
         // Check if we have RSI context
-        if let Some(rsi_context) = context.and_then(|ctx| ctx.downcast_ref::<RsiTradeContext>()) {
+        if let Some(rsi_context) = strategy_context.and_then(|ctx| ctx.downcast_ref::<RsiTradeContext>()) {
             println!("   📊 RSI Strategy Context:");
             println!("     - Current RSI: {:.2}", rsi_context.rsi_value);
             println!("     - Dynamic Oversold: {:.2}", rsi_context.dynamic_oversold);
@@ -200,13 +200,13 @@ impl TradeObserver for ContextAwareLogger {
         TradeDecision::Approve
     }
     
-    fn post_trade(&mut self, event: TradeEvent, context: Option<&dyn Any>) {
+    fn post_trade(&mut self, event: TradeEvent, strategy_context: Option<&dyn Any>) {
         match event {
             TradeEvent::Buy(_) => println!("   ✅ Buy trade executed"),
             TradeEvent::Sell(_) => println!("   ✅ Sell trade executed"),
         }
         
-        if let Some(rsi_context) = context.and_then(|ctx| ctx.downcast_ref::<RsiTradeContext>()) {
+        if let Some(rsi_context) = strategy_context.and_then(|ctx| ctx.downcast_ref::<RsiTradeContext>()) {
             println!("   📊 Trade executed with RSI: {:.2}", rsi_context.rsi_value);
         }
     }
