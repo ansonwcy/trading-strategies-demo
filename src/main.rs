@@ -2,13 +2,15 @@ use trading_strategies::Strategy;
 use trading_strategies::core::{ProposedTrade, TradeDecision, TradeEvent, TradeObserver};
 use trading_strategies::core::tick::TickData;
 use trading_strategies::core::tick_strategy::TickStrategyWrapper;
-use trading_strategies::strategies::config::StochasticConfig;
+use trading_strategies::strategies::config::{StochasticConfig, RSIConfig};
 use trading_strategies::strategies::stochastic::StochasticStrategy;
+use trading_strategies::strategies::rsi::{RSIStrategy, RsiTradeContext};
 use chrono;
 use std::sync::{Arc, Mutex};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 
 // Tick data structure matching the JSONL format
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -66,7 +68,7 @@ impl RiskManager {
 
 impl TradeObserver for RiskManager {
     // Called BEFORE trade execution
-    fn before_trade(&mut self, proposed: &ProposedTrade) -> TradeDecision {
+    fn before_trade(&mut self, proposed: &ProposedTrade, _context: Option<&dyn Any>) -> TradeDecision {
         self.trade_count += 1;
         let mut validated = self.counters.trades_validated.lock().unwrap();
         *validated += 1;
@@ -122,7 +124,7 @@ impl TradeObserver for RiskManager {
     }
     
     // Called AFTER trade execution
-    fn post_trade(&mut self, event: TradeEvent) {
+    fn post_trade(&mut self, event: TradeEvent, _context: Option<&dyn Any>) {
         let mut executed = self.counters.trades_executed.lock().unwrap();
         *executed += 1;
         let execution_num = *executed;
@@ -163,6 +165,53 @@ impl TradeObserver for RiskManager {
     }
 }
 
+// Context-aware observer that reads strategy-specific context
+struct ContextAwareLogger;
+
+impl TradeObserver for ContextAwareLogger {
+    fn before_trade(&mut self, proposed: &ProposedTrade, context: Option<&dyn Any>) -> TradeDecision {
+        println!("\n🔎 [CONTEXT-AWARE OBSERVER] Pre-trade analysis");
+        println!("   Proposed: {} {} units at ${:.2}", 
+            match proposed.side {
+                trading_strategies::core::Side::Long => "BUY",
+                trading_strategies::core::Side::Short => "SELL",
+            },
+            proposed.quantity,
+            proposed.price
+        );
+        
+        // Check if we have RSI context
+        if let Some(rsi_context) = context.and_then(|ctx| ctx.downcast_ref::<RsiTradeContext>()) {
+            println!("   📊 RSI Strategy Context:");
+            println!("     - Current RSI: {:.2}", rsi_context.rsi_value);
+            println!("     - Dynamic Oversold: {:.2}", rsi_context.dynamic_oversold);
+            println!("     - Dynamic Overbought: {:.2}", rsi_context.dynamic_overbought);
+            
+            // Could use this for advanced validation
+            if rsi_context.rsi_value < 20.0 {
+                println!("     ⚠️  WARNING: Extremely oversold (RSI < 20)");
+            } else if rsi_context.rsi_value > 80.0 {
+                println!("     ⚠️  WARNING: Extremely overbought (RSI > 80)");
+            }
+        } else {
+            println!("   ℹ️  No strategy-specific context provided");
+        }
+        
+        TradeDecision::Approve
+    }
+    
+    fn post_trade(&mut self, event: TradeEvent, context: Option<&dyn Any>) {
+        match event {
+            TradeEvent::Buy(_) => println!("   ✅ Buy trade executed"),
+            TradeEvent::Sell(_) => println!("   ✅ Sell trade executed"),
+        }
+        
+        if let Some(rsi_context) = context.and_then(|ctx| ctx.downcast_ref::<RsiTradeContext>()) {
+            println!("   📊 Trade executed with RSI: {:.2}", rsi_context.rsi_value);
+        }
+    }
+}
+
 // Helper function to format timestamps
 fn format_timestamp(timestamp: i64) -> String {
     use chrono::{DateTime, Utc};
@@ -189,8 +238,10 @@ fn load_ticks(filename: &str) -> Result<Vec<MarketTick>, Box<dyn std::error::Err
 }
 
 fn main() {
-    println!("=== Pre-trade/Post-trade Hooks Demo with Real Tick Data ===");
-    println!("=========================================================\n");
+    println!("=== Trading Observer Context Demo ===");
+    println!("=====================================");
+    println!("Demonstrating the new context parameter functionality");
+    println!("that allows strategies to pass custom data to observers\n");
     
     // Load tick data
     let ticks = match load_ticks("stochastic_hooks_demo.jsonl") {
@@ -322,4 +373,57 @@ fn main() {
     println!("   ✓ Pre-trade validation prevents bad trades");
     println!("   ✓ Trade modification ensures risk limits");
     println!("   ✓ Post-trade tracking for audit trails");
+    
+    // Now demonstrate RSI strategy with context
+    println!("\n\n╔══════════════════════════════════════════════╗");
+    println!("║    RSI STRATEGY WITH CONTEXT DEMONSTRATION   ║");
+    println!("╚══════════════════════════════════════════════╝");
+    
+    // Create RSI strategy configuration
+    let rsi_config = RSIConfig {
+        rsi_period: 14,
+        oversold_threshold: 30.0,
+        overbought_threshold: 70.0,
+        position_size: 1.0,
+        use_dynamic_levels: true,
+        volatility_window: 20,
+        overbought_min: 65.0,
+        overbought_max: 85.0,
+        oversold_min: 15.0,
+        oversold_max: 35.0,
+        atr_period: 14,
+        atr_multiplier: 2.0,
+    };
+    
+    // Create RSI strategy with context-aware observer
+    let rsi_strategy = RSIStrategy::new(rsi_config, 10000.0);
+    let mut rsi_tick_wrapper = TickStrategyWrapper::new(rsi_strategy, 10);
+    
+    // Add context-aware observer
+    println!("\n📋 Adding Context-Aware Observer to RSI Strategy");
+    println!("   This observer will receive RSI-specific context data");
+    rsi_tick_wrapper.strategy_mut().add_observer(Box::new(ContextAwareLogger));
+    
+    // Process all ticks for demonstration to ensure RSI has enough data
+    println!("\n📈 Processing ticks through RSI strategy...");
+    let demo_ticks = &ticks;
+    
+    for tick in demo_ticks {
+        rsi_tick_wrapper.process_tick(tick);
+    }
+    
+    // Force close any pending candle
+    if let Some(last_tick) = demo_ticks.last() {
+        rsi_tick_wrapper.force_close_candle(last_tick.timestamp + 1000);
+    }
+    
+    // Summary of context demonstration
+    println!("\n📊 Context Demonstration Summary:");
+    println!("   - Stochastic Strategy: Passed None as context");
+    println!("   - RSI Strategy: Passed RsiTradeContext with:");
+    println!("     • Current RSI value");
+    println!("     • Dynamic overbought threshold");
+    println!("     • Dynamic oversold threshold");
+    println!("\n✨ This allows observers to make more informed decisions");
+    println!("   based on strategy-specific internal state!");
 }
