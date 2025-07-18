@@ -1,10 +1,12 @@
-# Trading Testing - Observer Context Demo
+# Trading Testing - Simplified Hooks Demo
 
-Demonstrates the new observer context feature in the trading strategies library.
+Simple demonstration of trading strategy hooks and custom data features.
 
 ## Overview
 
-This example shows how trading strategies can pass custom context data to observers, allowing for more sophisticated trade monitoring and risk management.
+This example shows the two key hook features:
+1. **Pre-trade hooks** - modify, reject, or approve trades before execution
+2. **Strategy context & custom data** - access strategy state and custom data in observers
 
 ## Usage
 
@@ -12,65 +14,68 @@ This example shows how trading strategies can pass custom context data to observ
 cargo run
 ```
 
-## What it demonstrates
+## Demo 1: Pre-trade Hooks
 
-### 1. Basic Observer Pattern (Stochastic Strategy)
-- Shows traditional observer pattern without context
-- Implements pre-trade validation and post-trade logging
-- Demonstrates trade modification based on risk limits
+Shows how to use pre-trade hooks to:
+- **Reject** trades above a price threshold ($50,000)
+- **Modify** position sizes that exceed risk limits (max 2.0)
+- **Approve** normal trades that pass validation
 
-### 2. Context-Aware Observers (RSI Strategy)
-- Shows how strategies can pass custom context data
-- RSI strategy passes `RsiTradeContext` containing:
-  - Current RSI value
-  - Dynamic overbought threshold
-  - Dynamic oversold threshold
-- Observer can access this data to make informed decisions
-
-## Key Features Demonstrated
-
-### Pre-trade Hooks
-- Validate trades before execution
-- Reject trades based on price limits
-- Modify position sizes for risk management
-- Access strategy-specific context for advanced validation
-
-### Post-trade Hooks
-- Log executed trades
-- Track P&L and performance metrics
-- Access context data for detailed analysis
-
-## Configuration
-
-Edit `src/main.rs` to change strategy parameters:
-
-### Stochastic Strategy
-- `k_period` - stochastic K period (default: 14)
-- `d_period` - smoothing period (default: 3)
-- `oversold_threshold` - buy signal threshold (default: 20)
-- `overbought_threshold` - sell signal threshold (default: 80)
-
-### RSI Strategy
-- `rsi_period` - RSI calculation period (default: 14)
-- `oversold_threshold` - buy signal threshold (default: 30)
-- `overbought_threshold` - sell signal threshold (default: 70)
-- `use_dynamic_levels` - enable adaptive thresholds (default: true)
-
-## Example Output
-
+### Example Output
 ```
-🔎 [CONTEXT-AWARE OBSERVER] Pre-trade analysis
-   Proposed: BUY 1.0 units at $2850.50
-   📊 RSI Strategy Context:
-     - Current RSI: 28.45
-     - Dynamic Oversold: 32.10
-     - Dynamic Overbought: 67.90
-     ⚠️  WARNING: Extremely oversold (RSI < 30)
+Pre-trade Hook: Evaluating trade at $47000.00, size: 3.00
+  → MODIFIED: Position size reduced from 3.00 to 2.00
+
+Pre-trade Hook: Evaluating trade at $51000.00, size: 3.00
+  → REJECTED: Price too high ($51000.00 > $50,000)
+
+Pre-trade Hook: Evaluating trade at $48000.00, size: 3.00
+  → APPROVED: Trade looks good
 ```
 
-## Use Cases
+## Demo 2: Strategy Context & Custom Data
 
-1. **Risk Management**: Use context to implement sophisticated risk rules
-2. **Performance Analysis**: Log strategy-specific metrics with each trade
-3. **Compliance**: Ensure trades meet regulatory requirements based on market conditions
-4. **Strategy Optimization**: Collect detailed data for backtesting improvements
+Shows how to access:
+- **Strategy context** - RSI values, dynamic thresholds from the strategy
+- **Custom data** - user metadata passed to the strategy
+
+### Example Output
+```
+Trade #1: Long at $47000.00
+  Strategy Context:
+    RSI Value: 25.34
+    Overbought Level: 70.00
+    Oversold Level: 30.00
+  Custom Data:
+    User ID: user_123
+    Session ID: session_456
+    Risk Level: medium
+```
+
+## Key Features
+
+### PreTradeHookDemo Observer
+- Implements risk management rules
+- Tracks approved/modified/rejected trades
+- Can modify position sizes before execution
+
+### ContextDemo Observer  
+- Shows strategy context (RSI values, thresholds)
+- Displays custom data (user info, session data)
+- Logs detailed trade information
+
+## Simple Configuration
+
+The demo uses basic RSI strategy configuration:
+- RSI period: 14
+- Oversold threshold: 30.0
+- Overbought threshold: 70.0
+- Position size: 1.0-3.0 (depending on demo)
+
+## Sample Data
+
+Uses either:
+- `stochastic_hooks_demo.jsonl` if available
+- Built-in sample ticks with various price levels to trigger different hook behaviors
+
+This simplified demo focuses purely on demonstrating the core hook functionality without complex custom data structures or extensive logging.

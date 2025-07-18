@@ -1,18 +1,15 @@
 use trading_strategies::Strategy;
 use trading_strategies::core::{ProposedTrade, TradeDecision, TradeEvent, TradeObserver};
+use trading_strategies::core::types::TradeContext;
 use trading_strategies::core::tick::TickData;
 use trading_strategies::core::tick_strategy::TickStrategyWrapper;
-use trading_strategies::strategies::config::{StochasticConfig, RSIConfig};
-use trading_strategies::strategies::stochastic::StochasticStrategy;
+use trading_strategies::strategies::config::RSIConfig;
 use trading_strategies::strategies::rsi::{RSIStrategy, RsiTradeContext};
-use chrono;
-use std::sync::{Arc, Mutex};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use serde::{Deserialize, Serialize};
-use std::any::Any;
 
-// Tick data structure matching the JSONL format
+// Simple tick data structure
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct MarketTick {
     timestamp: i64,
@@ -27,365 +24,183 @@ impl TickData for MarketTick {
     fn symbol(&self) -> &str { "BTCUSDT" }
 }
 
-// Shared counters for tracking hook activity
-#[derive(Clone)]
-struct HookCounters {
-    trades_validated: Arc<Mutex<usize>>,
-    trades_rejected: Arc<Mutex<usize>>,
-    trades_modified: Arc<Mutex<usize>>,
-    trades_executed: Arc<Mutex<usize>>,
+// Simple custom data for demo
+#[derive(Debug, Clone)]
+struct TradeMetadata {
+    user_id: String,
+    session_id: String,
+    risk_level: String,
 }
 
-impl HookCounters {
-    fn new() -> Self {
+// Demo 1: Pre-trade hooks (modify, reject, approve)
+struct PreTradeHookDemo {
+    max_position_size: f64,
+    rejected_count: usize,
+    modified_count: usize,
+    approved_count: usize,
+}
+
+impl PreTradeHookDemo {
+    fn new(max_position_size: f64) -> Self {
         Self {
-            trades_validated: Arc::new(Mutex::new(0)),
-            trades_rejected: Arc::new(Mutex::new(0)),
-            trades_modified: Arc::new(Mutex::new(0)),
-            trades_executed: Arc::new(Mutex::new(0)),
+            max_position_size,
+            rejected_count: 0,
+            modified_count: 0,
+            approved_count: 0,
         }
     }
 }
 
-// Example observer that validates and modifies trades
-struct RiskManager {
-    max_price: f64,
-    max_position_size: f64,
-    counters: HookCounters,
+impl TradeObserver for PreTradeHookDemo {
+    fn pre_trade(&mut self, proposed_trade: &ProposedTrade, _context: TradeContext) -> TradeDecision {
+        println!("Pre-trade Hook: Evaluating trade at ${:.2}, size: {:.2}", 
+                 proposed_trade.price, proposed_trade.quantity);
+
+        // Rule 1: Reject trades above $50,000
+        if proposed_trade.price > 50000.0 {
+            self.rejected_count += 1;
+            println!("  → REJECTED: Price too high (${:.2} > $50,000)", proposed_trade.price);
+            return TradeDecision::Reject("Price too high".to_string());
+        }
+
+        // Rule 2: Modify position size if too large
+        if proposed_trade.quantity > self.max_position_size {
+            let old_size = proposed_trade.quantity;
+            let mut modified_trade = proposed_trade.clone();
+            modified_trade.quantity = self.max_position_size;
+            self.modified_count += 1;
+            println!("  → MODIFIED: Position size reduced from {:.2} to {:.2}", 
+                     old_size, modified_trade.quantity);
+            return TradeDecision::Modify(modified_trade);
+        }
+
+        // Rule 3: Approve normal trades
+        self.approved_count += 1;
+        println!("  → APPROVED: Trade looks good");
+        TradeDecision::Approve
+    }
+
+    fn post_trade(&mut self, _event: TradeEvent, _context: TradeContext) {
+        // No action needed for completed trades in this demo
+    }
+}
+
+// Demo 2: Strategy context and custom data observer
+struct ContextDemo {
     trade_count: usize,
 }
 
-impl RiskManager {
-    fn new(max_price: f64, max_position_size: f64, counters: HookCounters) -> Self {
-        Self { 
-            max_price, 
-            max_position_size,
-            counters,
-            trade_count: 0,
-        }
+impl ContextDemo {
+    fn new() -> Self {
+        Self { trade_count: 0 }
     }
 }
 
-impl TradeObserver for RiskManager {
-    // Called BEFORE trade execution
-    fn pre_trade(&mut self, proposed: &ProposedTrade, _strategy_context: Option<&dyn Any>) -> TradeDecision {
+impl TradeObserver for ContextDemo {
+    fn pre_trade(&mut self, _proposed_trade: &ProposedTrade, _context: TradeContext) -> TradeDecision {
+        TradeDecision::Approve
+    }
+
+    fn post_trade(&mut self, event: TradeEvent, context: TradeContext) {
         self.trade_count += 1;
-        let mut validated = self.counters.trades_validated.lock().unwrap();
-        *validated += 1;
-        let validation_num = *validated;
-        drop(validated);
         
-        println!("\n🔍 [PRE-TRADE HOOK] Validation #{}", validation_num);
-        println!("   Timestamp: {}", chrono::Local::now().format("%H:%M:%S%.3f"));
-        println!("   Proposed: {} {} units at ${:.2}", 
-            match proposed.side {
-                trading_strategies::core::Side::Long => "BUY",
-                trading_strategies::core::Side::Short => "SELL",
-            },
-            proposed.quantity,
-            proposed.price
-        );
+        let (side, trade) = match event {
+            TradeEvent::Buy(trade) => ("Long", trade),
+            TradeEvent::Sell(trade) => ("Short", trade),
+        };
         
-        // Validation 1: Check price limits
-        if proposed.price > self.max_price {
-            let mut rejected = self.counters.trades_rejected.lock().unwrap();
-            *rejected += 1;
-            println!("   ❌ REJECTED: Price ${:.2} exceeds limit ${:.2}", proposed.price, self.max_price);
-            return TradeDecision::Reject("Price too high".to_string());
+        println!("Trade #{}: {} at ${:.2}", 
+                 self.trade_count, side, trade.exit_price);
+
+        // Show strategy context if available
+        if let Some(rsi_context) = context.strategy_context
+            .and_then(|ctx| ctx.downcast_ref::<RsiTradeContext>()) {
+            println!("  Strategy Context:");
+            println!("    RSI Value: {:.2}", rsi_context.rsi_value);
+            println!("    Overbought Level: {:.2}", rsi_context.dynamic_overbought);
+            println!("    Oversold Level: {:.2}", rsi_context.dynamic_oversold);
         }
-        
-        // Validation 2: Check if position size exceeds max
-        if proposed.quantity > self.max_position_size {
-            let mut modified = self.counters.trades_modified.lock().unwrap();
-            *modified += 1;
-            println!("   ⚠️  MODIFIED: Reducing size from {:.2} to {:.2} units", proposed.quantity, self.max_position_size);
-            let mut modified_trade = proposed.clone();
-            modified_trade.quantity = self.max_position_size;
-            return TradeDecision::Modify(modified_trade);
-        }
-        
-        // Validation 3: Dynamic risk management - reduce position size when price is near limit
-        if proposed.price > 2950.0 && proposed.price <= self.max_price {
-            // High price zone (2950-3000) - reduce position for risk management
-            let risk_adjusted_size = proposed.quantity * 0.7; // Reduce by 30%
-            if risk_adjusted_size < proposed.quantity {
-                let mut modified = self.counters.trades_modified.lock().unwrap();
-                *modified += 1;
-                println!("   ⚠️  MODIFIED: High price zone (>${:.2}) - reducing size from {:.2} to {:.2} units for risk management", 
-                    2950.0, proposed.quantity, risk_adjusted_size);
-                let mut modified_trade = proposed.clone();
-                modified_trade.quantity = risk_adjusted_size;
-                return TradeDecision::Modify(modified_trade);
+
+        // Show custom data if available
+        if let Some(custom_data) = context.custom_data {
+            if let Some(metadata) = custom_data.downcast_ref::<TradeMetadata>() {
+                println!("  Custom Data:");
+                println!("    User ID: {}", metadata.user_id);
+                println!("    Session ID: {}", metadata.session_id);
+                println!("    Risk Level: {}", metadata.risk_level);
             }
         }
-        
-        println!("   ✅ APPROVED: Trade can proceed as proposed");
-        TradeDecision::Approve
-    }
-    
-    // Called AFTER trade execution
-    fn post_trade(&mut self, event: TradeEvent, _strategy_context: Option<&dyn Any>) {
-        let mut executed = self.counters.trades_executed.lock().unwrap();
-        *executed += 1;
-        let execution_num = *executed;
-        drop(executed);
-        
-        println!("\n📊 [POST-TRADE HOOK] Execution #{}", execution_num);
-        println!("   Timestamp: {}", chrono::Local::now().format("%H:%M:%S%.3f"));
-        
-        match event {
-            TradeEvent::Buy(trade) => {
-                println!("   Type: BUY ORDER EXECUTED");
-                println!("   Details:");
-                println!("     - Symbol: {}", trade.symbol);
-                println!("     - Entry Price: ${:.2}", trade.entry_price);
-                println!("     - Quantity: {} units", trade.quantity);
-                println!("     - Total Cost: ${:.2}", trade.entry_price * trade.quantity);
-                println!("     - Entry Time: {}", format_timestamp(trade.entry_time));
-                println!("   💰 Position opened successfully");
-            }
-            TradeEvent::Sell(trade) => {
-                println!("   Type: SELL ORDER EXECUTED");
-                println!("   Details:");
-                println!("     - Symbol: {}", trade.symbol);
-                println!("     - Entry Price: ${:.2}", trade.entry_price);
-                println!("     - Exit Price: ${:.2}", trade.exit_price);
-                println!("     - Quantity: {} units", trade.quantity);
-                println!("     - P&L: ${:.2} ({:.2}%)", trade.pnl, trade.pnl_percentage);
-                println!("     - Entry Time: {}", format_timestamp(trade.entry_time));
-                println!("     - Exit Time: {}", format_timestamp(trade.exit_time));
-                println!("     - Duration: {} minutes", (trade.exit_time - trade.entry_time) / 60000);
-                if trade.pnl > 0.0 {
-                    println!("   ✅ Profitable trade!");
-                } else {
-                    println!("   ❌ Loss incurred");
-                }
-            }
-        }
+        println!();
     }
 }
 
-// Context-aware observer that reads strategy-specific context
-struct ContextAwareLogger;
-
-impl TradeObserver for ContextAwareLogger {
-    fn pre_trade(&mut self, proposed: &ProposedTrade, strategy_context: Option<&dyn Any>) -> TradeDecision {
-        println!("\n🔎 [CONTEXT-AWARE OBSERVER] Pre-trade analysis");
-        println!("   Proposed: {} {} units at ${:.2}", 
-            match proposed.side {
-                trading_strategies::core::Side::Long => "BUY",
-                trading_strategies::core::Side::Short => "SELL",
-            },
-            proposed.quantity,
-            proposed.price
-        );
-        
-        // Check if we have RSI context
-        if let Some(rsi_context) = strategy_context.and_then(|ctx| ctx.downcast_ref::<RsiTradeContext>()) {
-            println!("   📊 RSI Strategy Context:");
-            println!("     - Current RSI: {:.2}", rsi_context.rsi_value);
-            println!("     - Dynamic Oversold: {:.2}", rsi_context.dynamic_oversold);
-            println!("     - Dynamic Overbought: {:.2}", rsi_context.dynamic_overbought);
-            
-            // Could use this for advanced validation
-            if rsi_context.rsi_value < 20.0 {
-                println!("     ⚠️  WARNING: Extremely oversold (RSI < 20)");
-            } else if rsi_context.rsi_value > 80.0 {
-                println!("     ⚠️  WARNING: Extremely overbought (RSI > 80)");
-            }
-        } else {
-            println!("   ℹ️  No strategy-specific context provided");
+fn load_ticks() -> Vec<MarketTick> {
+    let file_path = "stochastic_hooks_demo.jsonl";
+    let file = match File::open(file_path) {
+        Ok(f) => f,
+        Err(_) => {
+            println!("Warning: Could not load {}, using sample data", file_path);
+            return create_sample_ticks();
         }
-        
-        TradeDecision::Approve
-    }
-    
-    fn post_trade(&mut self, event: TradeEvent, strategy_context: Option<&dyn Any>) {
-        match event {
-            TradeEvent::Buy(_) => println!("   ✅ Buy trade executed"),
-            TradeEvent::Sell(_) => println!("   ✅ Sell trade executed"),
-        }
-        
-        if let Some(rsi_context) = strategy_context.and_then(|ctx| ctx.downcast_ref::<RsiTradeContext>()) {
-            println!("   📊 Trade executed with RSI: {:.2}", rsi_context.rsi_value);
-        }
-    }
-}
+    };
 
-// Helper function to format timestamps
-fn format_timestamp(timestamp: i64) -> String {
-    use chrono::{DateTime, Utc};
-    let secs = timestamp / 1000;
-    let dt = DateTime::<Utc>::from_timestamp(secs, 0).unwrap();
-    dt.format("%H:%M:%S").to_string()
-}
-
-// Load ticks from JSONL file
-fn load_ticks(filename: &str) -> Result<Vec<MarketTick>, Box<dyn std::error::Error>> {
-    let file = File::open(filename)?;
     let reader = BufReader::new(file);
     let mut ticks = Vec::new();
     
     for line in reader.lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            let tick: MarketTick = serde_json::from_str(&line)?;
-            ticks.push(tick);
+        if let Ok(line) = line {
+            if let Ok(tick) = serde_json::from_str::<MarketTick>(&line) {
+                ticks.push(tick);
+            }
         }
     }
     
-    Ok(ticks)
+    if ticks.is_empty() {
+        create_sample_ticks()
+    } else {
+        ticks
+    }
+}
+
+fn create_sample_ticks() -> Vec<MarketTick> {
+    vec![
+        MarketTick { timestamp: 1000, price: 45000.0, volume: 1.0 },
+        MarketTick { timestamp: 2000, price: 46000.0, volume: 1.5 },
+        MarketTick { timestamp: 3000, price: 47000.0, volume: 2.0 },
+        MarketTick { timestamp: 4000, price: 51000.0, volume: 1.0 }, // High price - should be rejected
+        MarketTick { timestamp: 5000, price: 48000.0, volume: 3.0 },
+        MarketTick { timestamp: 6000, price: 49000.0, volume: 2.5 },
+        MarketTick { timestamp: 7000, price: 47500.0, volume: 1.8 },
+        MarketTick { timestamp: 8000, price: 46500.0, volume: 2.2 },
+    ]
 }
 
 fn main() {
-    println!("=== Trading Observer Context Demo ===");
-    println!("=====================================");
-    println!("Demonstrating the new context parameter functionality");
-    println!("that allows strategies to pass custom data to observers\n");
-    
-    // Load tick data
-    let ticks = match load_ticks("stochastic_hooks_demo.jsonl") {
-        Ok(ticks) => {
-            println!("📁 Loaded {} ticks from stochastic_final_demo.jsonl", ticks.len());
-            ticks
-        }
-        Err(e) => {
-            eprintln!("❌ Error loading ticks: {}", e);
-            return;
-        }
-    };
-    
-    // Create strategy configuration
-    let config = StochasticConfig {
-        k_period: 14,             // Standard stochastic period
-        d_period: 3,              // Standard smoothing period
-        oversold_threshold: 20.0, // Buy signal below this level
-        overbought_threshold: 80.0, // Sell signal above this level
-        position_size: 1.5,       // Base position size (can be modified by risk manager)
-        atr_period: 14,
-        atr_multiplier: 2.0,
-    };
-    
-    // Create strategy wrapped for tick processing
-    let strategy = StochasticStrategy::new(config, 10000.0);
-    let mut tick_wrapper = TickStrategyWrapper::new(strategy, 10); // 10-second candles for more signals
-    
-    // Add risk manager with realistic limits
-    println!("\n📋 Risk Manager Configuration:");
-    println!("   - Max allowed price: $3,000.00");
-    println!("   - Max position size: 1.0 unit");
-    println!("   - Initial capital: $10,000.00");
-    
-    let counters = HookCounters::new();
-    let risk_manager = RiskManager::new(3000.0, 1.0, counters.clone());
-    tick_wrapper.strategy_mut().add_observer(Box::new(risk_manager));
-    
-    // Process ticks
-    println!("\n📈 Market Simulation Starting...");
-    println!("   Processing {} ticks", ticks.len());
-    if let (Some(first), Some(last)) = (ticks.first(), ticks.last()) {
-        println!("   Time range: {} to {}", 
-            format_timestamp(first.timestamp), 
-            format_timestamp(last.timestamp));
-        println!("   Price range: ${:.2} to ${:.2}\n", 
-            ticks.iter().map(|t| t.price).fold(f64::INFINITY, |a, b| a.min(b)),
-            ticks.iter().map(|t| t.price).fold(f64::NEG_INFINITY, |a, b| a.max(b)));
-    }
-    
-    // Track price for display
-    let mut last_price = 0.0;
-    let mut tick_count = 0;
-    
-    for tick in &ticks {
-        tick_count += 1;
-        
-        // Show price movement periodically (every 10 ticks)
-        if tick_count % 10 == 1 {
-            if last_price == 0.0 {
-                println!("⏱️  [{}] Price: ${:.2} (starting)", 
-                    format_timestamp(tick.timestamp), tick.price);
-            } else if tick.price > last_price {
-                println!("⏱️  [{}] Price: ${:.2} ↗️  (+{:.2}%)", 
-                    format_timestamp(tick.timestamp), 
-                    tick.price,
-                    ((tick.price - last_price) / last_price) * 100.0);
-            } else if tick.price < last_price {
-                println!("⏱️  [{}] Price: ${:.2} ↘️  ({:.2}%)", 
-                    format_timestamp(tick.timestamp), 
-                    tick.price,
-                    ((tick.price - last_price) / last_price) * 100.0);
-            } else {
-                println!("⏱️  [{}] Price: ${:.2} →", 
-                    format_timestamp(tick.timestamp), tick.price);
-            }
-            last_price = tick.price;
-        }
-        
-        // Process the tick
-        tick_wrapper.process_tick(tick);
-    }
-    
-    // Force close any pending candle
-    if let Some(last_tick) = ticks.last() {
-        tick_wrapper.force_close_candle(last_tick.timestamp + 1000);
-    }
-    
-    // Summary
-    println!("\n╔══════════════════════════════════╗");
-    println!("║        TRADING SUMMARY           ║");
-    println!("╚══════════════════════════════════╝");
-    
-    let trades = tick_wrapper.strategy().get_trades();
-    let final_price = ticks.last().map(|t| t.price).unwrap_or(100.0);
-    let final_equity = tick_wrapper.strategy().calculate_equity(final_price);
-    let total_pnl = final_equity - 10000.0;
-    
-    println!("📊 Performance Metrics:");
-    println!("   - Initial Capital: $10,000.00");
-    println!("   - Final Equity: ${:.2}", final_equity);
-    println!("   - Total P&L: ${:.2} ({:.2}%)", total_pnl, (total_pnl / 10000.0) * 100.0);
-    println!("   - Completed Trades: {}", trades.len());
-    
-    // Count winning/losing trades
-    let winning_trades = trades.iter().filter(|t| t.pnl > 0.0).count();
-    let losing_trades = trades.iter().filter(|t| t.pnl <= 0.0).count();
-    
-    println!("\n📈 Trade Statistics:");
-    println!("   - Winning Trades: {}", winning_trades);
-    println!("   - Losing Trades: {}", losing_trades);
-    if !trades.is_empty() {
-        println!("   - Win Rate: {:.1}%", (winning_trades as f64 / trades.len() as f64) * 100.0);
-    }
-    
-    println!("\n🔍 Hook Activity Summary:");
-    let validations = *counters.trades_validated.lock().unwrap();
-    let rejections = *counters.trades_rejected.lock().unwrap();
-    let modifications = *counters.trades_modified.lock().unwrap();
-    let executions = *counters.trades_executed.lock().unwrap();
-    
-    println!("   - Pre-trade validations: {} total", validations);
-    println!("     • Approved: {}", validations - rejections - modifications);
-    println!("     • Modified: {}", modifications);
-    println!("     • Rejected: {}", rejections);
-    println!("   - Post-trade notifications: {} events", executions);
-    
-    println!("\n💡 Benefits Demonstrated:");
-    println!("   ✓ Pre-trade validation prevents bad trades");
-    println!("   ✓ Trade modification ensures risk limits");
-    println!("   ✓ Post-trade tracking for audit trails");
-    
-    // Now demonstrate RSI strategy with context
-    println!("\n\n╔══════════════════════════════════════════════╗");
-    println!("║    RSI STRATEGY WITH CONTEXT DEMONSTRATION   ║");
-    println!("╚══════════════════════════════════════════════╝");
-    
-    // Create RSI strategy configuration
-    let rsi_config = RSIConfig {
+    println!("=== Trading Hooks Demo ===\n");
+
+    let ticks = load_ticks();
+    println!("Loaded {} ticks for demo\n", ticks.len());
+
+    // Demo 1: Pre-trade hooks (modify, reject, approve)
+    println!("--- Demo 1: Pre-trade Hooks ---");
+    demo_pre_trade_hooks(&ticks);
+
+    println!("\n{}\n", "=".repeat(50));
+
+    // Demo 2: Strategy context and custom data
+    println!("--- Demo 2: Strategy Context & Custom Data ---");
+    demo_strategy_context(&ticks);
+}
+
+fn demo_pre_trade_hooks(ticks: &[MarketTick]) {
+    println!("Testing pre-trade hooks: modify, reject, approve trades\n");
+
+    let config = RSIConfig {
         rsi_period: 14,
         oversold_threshold: 30.0,
         overbought_threshold: 70.0,
-        position_size: 1.0,
-        use_dynamic_levels: true,
+        position_size: 3.0, // Large size to trigger modifications
+        use_dynamic_levels: false,
         volatility_window: 20,
         overbought_min: 65.0,
         overbought_max: 85.0,
@@ -394,36 +209,87 @@ fn main() {
         atr_period: 14,
         atr_multiplier: 2.0,
     };
-    
-    // Create RSI strategy with context-aware observer
-    let rsi_strategy = RSIStrategy::new(rsi_config, 10000.0);
-    let mut rsi_tick_wrapper = TickStrategyWrapper::new(rsi_strategy, 10);
-    
-    // Add context-aware observer
-    println!("\n📋 Adding Context-Aware Observer to RSI Strategy");
-    println!("   This observer will receive RSI-specific context data");
-    rsi_tick_wrapper.strategy_mut().add_observer(Box::new(ContextAwareLogger));
-    
-    // Process all ticks for demonstration to ensure RSI has enough data
-    println!("\n📈 Processing ticks through RSI strategy...");
-    let demo_ticks = &ticks;
-    
-    for tick in demo_ticks {
-        rsi_tick_wrapper.process_tick(tick);
+
+    let rsi_strategy = RSIStrategy::new(config, 100000.0);
+    let mut rsi_wrapper = TickStrategyWrapper::new(rsi_strategy, 5);
+
+    // Add pre-trade hook observer
+    let hook_observer = PreTradeHookDemo::new(2.0); // Max position size: 2.0
+    rsi_wrapper.strategy_mut().add_observer(Box::new(hook_observer));
+
+    println!("Processing ticks...\n");
+    for tick in ticks {
+        rsi_wrapper.process_tick(tick, None);
     }
-    
-    // Force close any pending candle
-    if let Some(last_tick) = demo_ticks.last() {
-        rsi_tick_wrapper.force_close_candle(last_tick.timestamp + 1000);
+
+    if let Some(last_tick) = ticks.last() {
+        rsi_wrapper.force_close_candle(last_tick.timestamp + 1000);
     }
-    
-    // Summary of context demonstration
-    println!("\n📊 Context Demonstration Summary:");
-    println!("   - Stochastic Strategy: Passed None as context");
-    println!("   - RSI Strategy: Passed RsiTradeContext with:");
-    println!("     • Current RSI value");
-    println!("     • Dynamic overbought threshold");
-    println!("     • Dynamic oversold threshold");
-    println!("\n✨ This allows observers to make more informed decisions");
-    println!("   based on strategy-specific internal state!");
+
+    println!("\nPre-trade Hook Results:");
+    println!("  Note: Observer results would be tracked separately in a real implementation");
+    println!("  Check console output above for individual trade decisions");
+}
+
+fn demo_strategy_context(ticks: &[MarketTick]) {
+    println!("Testing strategy context and custom data flow\n");
+
+    let config = RSIConfig {
+        rsi_period: 14,
+        oversold_threshold: 30.0,
+        overbought_threshold: 70.0,
+        position_size: 1.0,
+        use_dynamic_levels: true, // Enable dynamic levels for context
+        volatility_window: 20,
+        overbought_min: 65.0,
+        overbought_max: 85.0,
+        oversold_min: 15.0,
+        oversold_max: 35.0,
+        atr_period: 14,
+        atr_multiplier: 2.0,
+    };
+
+    let rsi_strategy = RSIStrategy::new(config, 100000.0);
+    let mut rsi_wrapper = TickStrategyWrapper::new(rsi_strategy, 5);
+
+    // Add context observer
+    let context_observer = ContextDemo::new();
+    rsi_wrapper.strategy_mut().add_observer(Box::new(context_observer));
+
+    // Create different custom data for different users/sessions
+    let users = ["alice", "bob", "charlie", "david", "eve"];
+    let risk_levels = ["low", "medium", "high", "medium", "low"];
+    let mut user_index = 0;
+    let mut session_counter = 1000;
+
+    println!("Processing ticks with custom data...\n");
+    for (i, tick) in ticks.iter().enumerate() {
+        // Change user every 20 ticks
+        if i % 20 == 0 && i > 0 {
+            user_index = (user_index + 1) % users.len();
+            session_counter += 1;
+        }
+        
+        // Create dynamic custom data
+        let custom_data = TradeMetadata {
+            user_id: format!("user_{}", users[user_index]),
+            session_id: format!("session_{}", session_counter),
+            risk_level: risk_levels[user_index].to_string(),
+        };
+        
+        rsi_wrapper.process_tick(tick, Some(&custom_data));
+    }
+
+    if let Some(last_tick) = ticks.last() {
+        // Use the last user's data for the final candle close
+        let final_custom_data = TradeMetadata {
+            user_id: format!("user_{}", users[user_index]),
+            session_id: format!("session_{}", session_counter),
+            risk_level: risk_levels[user_index].to_string(),
+        };
+        rsi_wrapper.force_close_candle_with_custom_data(last_tick.timestamp + 1000, Some(&final_custom_data));
+    }
+
+    let trades = rsi_wrapper.strategy().get_trades();
+    println!("Total trades executed: {}", trades.len());
 }
